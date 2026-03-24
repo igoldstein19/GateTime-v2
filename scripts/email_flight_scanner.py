@@ -1,15 +1,17 @@
 """
 GateTime Flight Email Scanner
 Reads Gmail for flight confirmation emails, parses flight details with Claude,
-and creates a Google Calendar event automatically.
+creates a Google Calendar event, and sends an email reminder 5 hours before
+departure with GateTime's "Arrive at airport by" breakdown.
 """
 
 import os
 import base64
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email import message_from_bytes
+from email.mime.text import MIMEText
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -19,11 +21,12 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
-# Gmail + Calendar both need these scopes
+# Gmail + Calendar + Send scopes
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
@@ -244,6 +247,221 @@ def create_calendar_event(calendar_service, flight: dict, trip: dict) -> str:
     return created.get("htmlLink", "")
 
 
+# ─── GateTime Airport Arrival Calculator ─────────────────────────────────────
+
+# Seed estimates: terminal -> time_bucket -> {check_in, security}
+SEED_ESTIMATES = {
+    "A": {"early_morning": (8, 8), "morning": (15, 20), "midday": (10, 12), "afternoon": (15, 18), "evening": (12, 15)},
+    "B": {"early_morning": (10, 10), "morning": (18, 25), "midday": (12, 15), "afternoon": (18, 22), "evening": (14, 18)},
+    "C": {"early_morning": (8, 10), "morning": (15, 22), "midday": (10, 14), "afternoon": (15, 20), "evening": (12, 16)},
+    "E": {"early_morning": (12, 12), "morning": (20, 25), "midday": (15, 15), "afternoon": (22, 25), "evening": (18, 20)},
+}
+
+WALK_TIMES = {"A": 6, "B": 6, "C": 5, "E": 6}  # avg walk minutes per terminal
+
+# Airline -> terminal mapping for BOS
+AIRLINE_TERMINAL = {
+    "delta": "A",
+    "american": "B", "american airlines": "B",
+    "united": "B", "united airlines": "B",
+    "jetblue": "C",
+    "southwest": "B", "southwest airlines": "B",
+    "spirit": "B", "spirit airlines": "B",
+    "frontier": "B", "frontier airlines": "B",
+    "air canada": "B",
+    "cape air": "C",
+    "british airways": "E",
+    "emirates": "E",
+    "aer lingus": "E",
+    "tap air portugal": "E", "tap portugal": "E",
+    "iberia": "E",
+    "latam": "E", "latam airlines": "E",
+    "lufthansa": "E",
+    "turkish airlines": "E", "turkish": "E",
+    "copa airlines": "E", "copa": "E",
+}
+
+INTERNATIONAL_TERMINALS = {"E"}
+
+
+def get_time_bucket(hour: int) -> str:
+    if 4 <= hour < 7: return "early_morning"
+    if 7 <= hour < 10: return "morning"
+    if 10 <= hour < 14: return "midday"
+    if 14 <= hour < 17: return "afternoon"
+    return "evening"
+
+
+def calculate_arrive_by(departure_dt: datetime, airline: str) -> dict:
+    """Calculate when to arrive at the airport, working backward from flight time."""
+    # Resolve terminal
+    airline_lower = airline.lower().strip()
+    terminal = None
+    for key, term in AIRLINE_TERMINAL.items():
+        if key in airline_lower or airline_lower in key:
+            terminal = term
+            break
+    if not terminal:
+        terminal = "B"  # default fallback
+
+    is_international = terminal in INTERNATIONAL_TERMINALS
+    boarding_buffer = 45 if is_international else 30
+    walk_time = WALK_TIMES.get(terminal, 6)
+
+    # Work backward to estimate arrival time bucket
+    estimated_arrival_hour = (departure_dt - timedelta(minutes=boarding_buffer + walk_time + 20)).hour
+    time_bucket = get_time_bucket(estimated_arrival_hour)
+
+    check_in, security = SEED_ESTIMATES.get(terminal, SEED_ESTIMATES["B"]).get(time_bucket, (15, 20))
+
+    total_buffer = boarding_buffer + walk_time + security + check_in
+    arrive_by = departure_dt - timedelta(minutes=total_buffer)
+
+    return {
+        "arrive_by": arrive_by,
+        "terminal": terminal,
+        "is_international": is_international,
+        "boarding_buffer": boarding_buffer,
+        "walk_time": walk_time,
+        "security": security,
+        "check_in": check_in,
+        "total_buffer": total_buffer,
+    }
+
+
+# ─── Email Reminder ──────────────────────────────────────────────────────────
+
+def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, calc: dict):
+    """Send an HTML email reminder with GateTime's arrive-by breakdown."""
+    dep_dt = datetime.fromisoformat(flight["departure_datetime"])
+    arrive_by = calc["arrive_by"]
+
+    subject = f"GateTime Reminder: Arrive at BOS by {arrive_by.strftime('%I:%M %p')} for {flight['flight_number']}"
+
+    html = f"""<html><body style="font-family: 'Inter', Arial, sans-serif; background: #F5F6F8; padding: 20px;">
+<div style="max-width: 560px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.06);">
+
+  <!-- Header -->
+  <div style="background: #0A0F1E; padding: 32px 28px; text-align: center;">
+    <div style="color: #C5A255; font-size: 12px; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 4px;">GateTime Reminder</div>
+    <div style="color: white; font-size: 14px; opacity: 0.6; margin-bottom: 16px;">Boston Logan International (BOS)</div>
+    <div style="color: #34D399; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 6px;">ARRIVE AT AIRPORT BY</div>
+    <div style="color: white; font-size: 48px; font-weight: 700; font-family: 'Poppins', Arial, sans-serif; line-height: 1.1;">{arrive_by.strftime('%I:%M %p')}</div>
+    <div style="color: rgba(255,255,255,0.5); font-size: 13px; margin-top: 8px;">Terminal {calc['terminal']} &middot; {trip.get('airline', 'Airline')}</div>
+  </div>
+
+  <!-- Flight info -->
+  <div style="padding: 24px 28px; border-bottom: 1px solid #F0F0F0;">
+    <div style="font-size: 11px; color: #6B7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Your Flight</div>
+    <div style="font-size: 18px; font-weight: 700; color: #1A1A2E; margin-bottom: 4px;">{flight['flight_number']}: {flight['origin']} &rarr; {flight['destination']}</div>
+    <div style="font-size: 14px; color: #6B7280;">Departs {dep_dt.strftime('%B %d, %Y')} at {dep_dt.strftime('%I:%M %p')}</div>
+    <div style="font-size: 13px; color: #6B7280; margin-top: 2px;">Confirmation: <strong>{trip.get('confirmation_code', 'N/A')}</strong></div>
+  </div>
+
+  <!-- Timeline breakdown -->
+  <div style="padding: 24px 28px;">
+    <div style="font-size: 11px; color: #6B7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px;">Your Timeline</div>
+
+    <!-- Arrive at airport -->
+    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 14px; height: 14px; border-radius: 50%; background: #34D399; border: 3px solid #D1FAE5;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 15px; font-weight: 700; color: #1A1A2E;">{arrive_by.strftime('%I:%M %p')} - Arrive at airport</div>
+        <div style="font-size: 12px; color: #6B7280;">Terminal {calc['terminal']} entrance</div>
+      </div>
+    </div>
+
+    <!-- Check-in -->
+    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 10px; height: 10px; border-radius: 50%; background: #3B82F6; margin-top: 2px;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 14px; color: #1A1A2E;"><strong>{calc['check_in']} min</strong> - Check-in</div>
+      </div>
+    </div>
+
+    <!-- Security -->
+    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 10px; height: 10px; border-radius: 50%; background: #F59E0B; margin-top: 2px;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 14px; color: #1A1A2E;"><strong>{calc['security']} min</strong> - Security</div>
+      </div>
+    </div>
+
+    <!-- Walk to gate -->
+    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 10px; height: 10px; border-radius: 50%; background: #6B7280; margin-top: 2px;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 14px; color: #1A1A2E;"><strong>{calc['walk_time']} min</strong> - Walk to gate</div>
+      </div>
+    </div>
+
+    <!-- Boarding -->
+    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 10px; height: 10px; border-radius: 50%; background: #34D399; margin-top: 2px;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 14px; color: #1A1A2E;"><strong>{calc['boarding_buffer']} min</strong> - Boarding {'(international)' if calc['is_international'] else ''}</div>
+      </div>
+    </div>
+
+    <!-- Departure -->
+    <div style="display: flex; align-items: flex-start;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 14px; height: 14px; border-radius: 50%; background: #0A0F1E; border: 3px solid #D1D5DB;"></div>
+      </div>
+      <div style="margin-left: 12px;">
+        <div style="font-size: 15px; font-weight: 700; color: #1A1A2E;">{dep_dt.strftime('%I:%M %p')} - Flight departs</div>
+        <div style="font-size: 12px; color: #6B7280;">{flight['flight_number']} to {flight['destination']}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer note -->
+  <div style="padding: 16px 28px; background: #F9FAFB; border-top: 1px solid #F0F0F0; text-align: center;">
+    <div style="font-size: 11px; color: #9CA3AF;">Allow extra 10 min if driving/parking &middot; Estimates based on GateTime data</div>
+    <div style="font-size: 11px; color: #9CA3AF; margin-top: 4px;">Visit <a href="https://gatetime-v2.vercel.app" style="color: #34D399; text-decoration: none;">GateTime</a> for live wait times</div>
+  </div>
+
+</div>
+</body></html>"""
+
+    message = MIMEText(html, "html")
+    message["to"] = to_email
+    message["subject"] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+    gmail_service.users().messages().send(
+        userId="me", body={"raw": raw}
+    ).execute()
+
+    print(f"     Email reminder sent to {to_email}")
+
+
+def schedule_reminder(gmail_service, to_email: str, flight: dict, trip: dict, calc: dict):
+    """Send reminder immediately (for now). In production, schedule 5h before departure."""
+    dep_dt = datetime.fromisoformat(flight["departure_datetime"])
+    arrive_by = calc["arrive_by"]
+
+    print(f"     Arrive at airport by: {arrive_by.strftime('%I:%M %p')}")
+    print(f"     Breakdown: check-in {calc['check_in']}m + security {calc['security']}m + walk {calc['walk_time']}m + boarding {calc['boarding_buffer']}m = {calc['total_buffer']}m before flight")
+
+    send_reminder_email(gmail_service, to_email, flight, trip, calc)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -256,10 +474,15 @@ def main():
     emails = search_flight_emails(gmail, max_results=10)
 
     if not emails:
-        print("Done — no flight emails found.")
+        print("Done - no flight emails found.")
         return
 
     print(f"Found {len(emails)} candidate email(s). Parsing with Claude...")
+
+    # Get user's email for reminders
+    profile = gmail.users().getProfile(userId="me").execute()
+    user_email = profile["emailAddress"]
+    print(f"Signed in as: {user_email}")
 
     created_count = 0
     for email in emails:
@@ -267,18 +490,24 @@ def main():
         trip = parse_flight_details(email)
 
         if not trip:
-            print("  → Not a flight confirmation, skipping.")
+            print("  -> Not a flight confirmation, skipping.")
             continue
 
-        print(f"  → Flight found! {trip.get('airline')} | {trip.get('confirmation_code')}")
+        print(f"  -> Flight found! {trip.get('airline')} | {trip.get('confirmation_code')}")
 
         for flight in trip.get("flights", []):
-            print(f"     {flight['flight_number']}: {flight['origin']} → {flight['destination']}")
+            print(f"     {flight['flight_number']}: {flight['origin']} -> {flight['destination']}")
             url = create_calendar_event(calendar, flight, trip)
             print(f"     Calendar event created: {url}")
+
+            # Calculate GateTime arrive-by and send email reminder
+            dep_dt = datetime.fromisoformat(flight["departure_datetime"])
+            calc = calculate_arrive_by(dep_dt, trip.get("airline", ""))
+            schedule_reminder(gmail, user_email, flight, trip, calc)
+
             created_count += 1
 
-    print(f"\nDone. Created {created_count} calendar event(s).")
+    print(f"\nDone. Created {created_count} calendar event(s) with email reminders.")
 
 
 if __name__ == "__main__":
