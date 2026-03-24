@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background-color: #F5F6F8;
+    color: #1A1A2E;
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #__next, html, body { min-height: 100svh; }
+}
+
+@layer utilities {
+  .num {
+    font-family: 'Poppins', system-ui, sans-serif;
+    font-feature-settings: 'tnum';
+  }
+
+  .card {
+    background: #FFFFFF;
+    border-radius: 1rem;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+
+  .card-hover {
+    background: #FFFFFF;
+    border-radius: 1rem;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    transition: box-shadow 0.2s ease, transform 0.2s ease;
+  }
+  .card-hover:hover {
+    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+  }
+  .card-hover:active {
+    transform: scale(0.99);
+  }
+
+  .hero-dark {
+    background: #0A0F1E;
+    border-radius: 0 0 24px 24px;
+    position: relative;
+    z-index: 1;
+  }
+
+  /* Status colors */
+  .status-green  { color: #34D399; }
+  .status-amber  { color: #F59E0B; }
+  .status-red    { color: #EF4444; }
+
+  .animate-slide-up {
+    animation: slideUp 0.4s ease-out both;
+  }
+  .delay-100 { animation-delay: 0.1s; }
+  .delay-150 { animation-delay: 0.15s; }
+  .delay-200 { animation-delay: 0.2s; }
+  .delay-300 { animation-delay: 0.3s; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes countUp {
+  from { opacity: 0; transform: translateY(8px) scale(0.95); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
