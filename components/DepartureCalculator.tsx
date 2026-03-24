@@ -1,21 +1,15 @@
 'use client'
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plane, ChevronDown, Car } from 'lucide-react'
+import { Plane, ChevronDown, Car, MapPin, Loader2 } from 'lucide-react'
 import { AIRLINES, DOMESTIC_AIRLINES, INTERNATIONAL_AIRLINES } from '../lib/data/airlines'
 import { calculateLeaveBy } from '../lib/calculator'
 import { format } from 'date-fns'
+import type { DriveTimeResult } from '../lib/driveTime'
 
 function formatTime(d: Date) {
   return format(d, 'h:mm a')
 }
-
-const TIMELINE_STEPS = [
-  { key: 'checkin',   label: 'Check-in',        dotBorder: 'border-[#3B82F6]' },
-  { key: 'security',  label: 'Security',         dotBorder: 'border-[#F59E0B]' },
-  { key: 'walk',      label: 'Walk to gate',     dotBorder: 'border-[#6B7280]' },
-  { key: 'boarding',  label: 'Boarding buffer',   dotBorder: 'border-[#34D399]' },
-]
 
 export default function DepartureCalculator() {
   const router = useRouter()
@@ -24,11 +18,15 @@ export default function DepartureCalculator() {
   const [flightMin, setFlightMin]   = useState('00')
   const [ampm, setAmpm]             = useState<'AM' | 'PM'>('AM')
   const [gate, setGate]             = useState('')
+  const [address, setAddress]       = useState('')
+  const [driveResult, setDriveResult] = useState<DriveTimeResult | null>(null)
+  const [driveLoading, setDriveLoading] = useState(false)
+  const [driveError, setDriveError] = useState('')
   const [result, setResult] = useState<ReturnType<typeof calculateLeaveBy>>(null)
 
   const airline = AIRLINES.find(a => a.id === airlineId)
 
-  const calculate = () => {
+  const calculate = async () => {
     if (!airlineId) return
     const now   = new Date()
     let h = parseInt(flightHour) % 12
@@ -37,23 +35,60 @@ export default function DepartureCalculator() {
     if (flight < now) flight.setDate(flight.getDate() + 1)
     const r = calculateLeaveBy(flight, airlineId, gate || undefined)
     setResult(r)
+
+    // If address provided, fetch drive time
+    if (address.trim()) {
+      setDriveLoading(true)
+      setDriveError('')
+      setDriveResult(null)
+      try {
+        const params = new URLSearchParams({ origin: address.trim(), airport: 'BOS' })
+        if (r) {
+          params.set('departureTime', r.arriveBy.toISOString())
+        }
+        const res = await fetch(`/api/drive-time?${params}`)
+        if (res.ok) {
+          const data: DriveTimeResult = await res.json()
+          setDriveResult(data)
+        } else {
+          const body = await res.json().catch(() => ({}))
+          if (res.status === 503) {
+            // API not configured — fail silently
+            setDriveResult(null)
+          } else {
+            setDriveError(body.detail || 'Could not calculate drive time')
+          }
+        }
+      } catch {
+        setDriveError('Network error fetching drive time')
+      } finally {
+        setDriveLoading(false)
+      }
+    } else {
+      setDriveResult(null)
+    }
   }
 
+  // Compute "leave home by" if we have both results
+  const leaveHomeBy = result && driveResult
+    ? new Date(result.arriveBy.getTime() - driveResult.durationInTrafficMinutes * 60_000)
+    : null
+
   return (
-    <div className="card p-5 animate-slide-up">
-      <div className="flex items-center gap-2 mb-4">
+    <div className="card p-6 lg:p-8 animate-slide-up">
+      <div className="flex items-center gap-2 mb-5">
         <Plane size={16} className="text-[#34D399]" />
-        <span className="text-[11px] font-bold text-[#6B7280] uppercase tracking-widest">When should I arrive?</span>
+        <span className="text-sm font-bold text-[#1A1A2E]">When should I leave?</span>
       </div>
 
-      <div className="space-y-3">
+      <div className="space-y-4">
         {/* Airline selector */}
         <div>
           <label className="block text-[11px] text-[#6B7280] font-medium uppercase tracking-wider mb-1.5">Airline</label>
           <div className="relative">
             <select
               value={airlineId}
-              onChange={e => { setAirlineId(e.target.value); setResult(null) }}
+              onChange={e => { setAirlineId(e.target.value); setResult(null); setDriveResult(null) }}
               className="w-full bg-white border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm text-gray-900 font-medium appearance-none focus:outline-none focus:border-[#34D399] focus:ring-1 focus:ring-[#34D399]/20 transition-colors"
             >
               <option value="">Select your airline…</option>
@@ -111,19 +146,36 @@ export default function DepartureCalculator() {
           </div>
         </div>
 
-        {/* Gate (optional) */}
-        <div>
-          <label className="block text-[11px] text-[#6B7280] font-medium uppercase tracking-wider mb-1.5">
-            Gate <span className="text-gray-400 normal-case tracking-normal font-normal">(optional)</span>
-          </label>
-          <input
-            type="text"
-            value={gate}
-            onChange={e => setGate(e.target.value)}
-            placeholder="e.g. B32"
-            maxLength={8}
-            className="w-full bg-white border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm font-mono text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-[#34D399] focus:ring-1 focus:ring-[#34D399]/20 transition-colors"
-          />
+        {/* Two-column: Gate + Address */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[11px] text-[#6B7280] font-medium uppercase tracking-wider mb-1.5">
+              Gate <span className="text-gray-400 normal-case tracking-normal font-normal">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={gate}
+              onChange={e => setGate(e.target.value)}
+              placeholder="e.g. B32"
+              maxLength={8}
+              className="w-full bg-white border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm font-mono text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-[#34D399] focus:ring-1 focus:ring-[#34D399]/20 transition-colors"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] text-[#6B7280] font-medium uppercase tracking-wider mb-1.5">
+              Your location <span className="text-gray-400 normal-case tracking-normal font-normal">(optional)</span>
+            </label>
+            <div className="relative">
+              <MapPin size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={address}
+                onChange={e => setAddress(e.target.value)}
+                placeholder="e.g. Cambridge, MA"
+                className="w-full bg-white border border-gray-200 rounded-xl pl-8 pr-3.5 py-2.5 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-[#34D399] focus:ring-1 focus:ring-[#34D399]/20 transition-colors"
+              />
+            </div>
+          </div>
         </div>
 
         {/* Calculate button */}
@@ -138,25 +190,66 @@ export default function DepartureCalculator() {
 
       {/* Result + Timeline on dark card */}
       {result && (
-        <div className="mt-5 bg-[#0A0F1E] rounded-2xl p-5 animate-slide-up">
-          {/* Hero arrival time */}
-          <p className="text-[10px] text-[#34D399] uppercase tracking-widest font-bold mb-1">Arrive at airport by</p>
-          <div className="num text-5xl font-bold text-white leading-none mb-2">
-            {formatTime(result.arriveBy)}
-          </div>
+        <div className="mt-5 bg-[#0A0F1E] rounded-2xl p-5 lg:p-6 animate-slide-up">
+          {/* Hero time */}
+          {leaveHomeBy ? (
+            <>
+              <p className="text-[10px] text-[#34D399] uppercase tracking-widest font-bold mb-1">Leave home by</p>
+              <div className="num text-4xl lg:text-5xl font-bold text-white leading-none mb-1">
+                {formatTime(leaveHomeBy)}
+              </div>
+              <p className="text-xs text-white/50 mb-1">
+                Arrive at airport by {formatTime(result.arriveBy)}
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-[10px] text-[#34D399] uppercase tracking-widest font-bold mb-1">Arrive at airport by</p>
+              <div className="num text-4xl lg:text-5xl font-bold text-white leading-none mb-2">
+                {formatTime(result.arriveBy)}
+              </div>
+            </>
+          )}
           <p className="text-sm text-white/60 mb-6">
             Terminal {result.terminalCode} · {airline?.name}
           </p>
 
           {/* Vertical timeline */}
           <div className="relative pl-8 space-y-0">
+            {/* Leave home — only if drive time available */}
+            {driveResult && leaveHomeBy && (
+              <div className="relative pb-5">
+                <div className="absolute left-[-20px] top-[3px] w-4 h-4 rounded-full bg-[#0A0F1E] border-2 border-[#34D399] z-10" />
+                <div className="absolute left-[-13px] top-[19px] bottom-0 w-px bg-white/15" />
+                <div className="flex justify-between items-baseline">
+                  <span className="text-sm font-bold text-white">Leave home</span>
+                  <span className="num text-lg font-bold text-white">{formatTime(leaveHomeBy)}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Drive to airport — only if drive time */}
+            {driveResult && (
+              <div className="relative pb-5">
+                <div className="absolute left-[-20px] top-[3px] w-3 h-3 rounded-full bg-[#0A0F1E] border-2 border-[#60A5FA] z-10 mt-0.5" />
+                <div className="absolute left-[-13px] top-[19px] bottom-0 w-px bg-white/15" />
+                <div className="flex justify-between items-baseline">
+                  <div>
+                    <span className="text-sm text-white/70">Drive to Logan</span>
+                    <span className="text-[10px] text-white/40 ml-2">{driveResult.distanceMiles} mi</span>
+                  </div>
+                  <span className="num text-base font-semibold text-white">{driveResult.durationInTrafficMinutes} min</span>
+                </div>
+              </div>
+            )}
+
             {/* Arrive at airport — top node */}
             <div className="relative pb-5">
-              <div className="absolute left-[-20px] top-[3px] w-4 h-4 rounded-full bg-[#0A0F1E] border-2 border-white z-10" />
+              <div className={`absolute left-[-20px] top-[3px] ${driveResult ? 'w-3 h-3 mt-0.5' : 'w-4 h-4'} rounded-full bg-[#0A0F1E] border-2 border-white z-10`} />
               <div className="absolute left-[-13px] top-[19px] bottom-0 w-px bg-white/15" />
               <div className="flex justify-between items-baseline">
-                <span className="text-sm font-bold text-white">Arrive at airport</span>
-                <span className="num text-lg font-bold text-white">{formatTime(result.arriveBy)}</span>
+                <span className={`text-sm ${driveResult ? 'text-white/70' : 'font-bold text-white'}`}>Arrive at airport</span>
+                <span className={`num ${driveResult ? 'text-base font-semibold' : 'text-lg font-bold'} text-white`}>{formatTime(result.arriveBy)}</span>
               </div>
             </div>
 
@@ -210,11 +303,27 @@ export default function DepartureCalculator() {
             </div>
           </div>
 
-          {/* Parking note */}
-          <div className="flex items-center gap-2 mt-5">
-            <Car size={14} className="text-white/40 flex-shrink-0" />
-            <p className="text-[12px] text-white/40">Allow extra {result.breakdown.parkingBuffer} min if driving/parking</p>
-          </div>
+          {/* Drive time loading/error */}
+          {driveLoading && (
+            <div className="flex items-center gap-2 mt-5">
+              <Loader2 size={14} className="text-white/40 animate-spin" />
+              <p className="text-[12px] text-white/40">Calculating drive time…</p>
+            </div>
+          )}
+          {driveError && (
+            <div className="flex items-center gap-2 mt-5">
+              <Car size={14} className="text-red-400/60 flex-shrink-0" />
+              <p className="text-[12px] text-red-400/60">{driveError}</p>
+            </div>
+          )}
+
+          {/* Parking note — only show if no drive time (otherwise drive time replaces it) */}
+          {!driveResult && (
+            <div className="flex items-center gap-2 mt-5">
+              <Car size={14} className="text-white/40 flex-shrink-0" />
+              <p className="text-[12px] text-white/40">Allow extra {result.breakdown.parkingBuffer} min if driving/parking</p>
+            </div>
+          )}
         </div>
       )}
 

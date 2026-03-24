@@ -47,7 +47,7 @@ export default function TerminalPage() {
     ensureSeeded()
 
     // Fetch real-time TSA data then refresh estimates
-    fetchTsaWait(terminal.airportCode ?? 'BOS').then(data => {
+    fetchTsaWait(terminal?.airportCode ?? 'BOS').then(data => {
       const mins = data?.airportAvgMinutes ?? undefined
       setApiSecurityMinutes(mins)
       refresh(mins)
@@ -55,7 +55,7 @@ export default function TerminalPage() {
 
     refresh(apiSecurityMinutes)
     const id = setInterval(() => {
-      fetchTsaWait(terminal.airportCode ?? 'BOS').then(data => {
+      fetchTsaWait(terminal?.airportCode ?? 'BOS').then(data => {
         const mins = data?.airportAvgMinutes ?? undefined
         setApiSecurityMinutes(mins)
         refresh(mins)
