@@ -6,6 +6,7 @@ node_modules/
 # Secrets — never commit these
 .env
 .env.local
+.env*.local
 scripts/.env
 scripts/credentials.json
 scripts/token.json
