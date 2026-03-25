@@ -6,7 +6,7 @@ export async function POST() {
   const scriptsDir = path.join(process.cwd(), 'scripts')
   const scriptPath = path.join(scriptsDir, 'email_flight_scanner.py')
 
-  return new Promise((resolve) => {
+  return new Promise<Response>((resolve) => {
     exec(
       `py "${scriptPath}"`,
       {
