@@ -1,14 +1,19 @@
 """
-GateTime Flight Email Scanner
+GateTime Flight Email Scanner v2
 Reads Gmail for flight confirmation emails, parses flight details with Claude,
-creates a Google Calendar event, and sends an email reminder 5 hours before
-departure with GateTime's "Arrive at airport by" breakdown.
+creates Google Calendar events, and sends scheduled email reminders:
+  - 1 day before departure: full timeline with leave-home + arrive-at-airport times
+  - 5 hours before leave time: urgent reminder with fresh traffic data
+
+Integrates Google Routes API for drive time from home to BOS.
 """
 
 import os
+import sys
 import base64
 import json
 import re
+import requests
 from datetime import datetime, timezone, timedelta
 from email import message_from_bytes
 from email.mime.text import MIMEText
@@ -21,7 +26,17 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+# Fix Unicode output on Windows (cp932)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+
+# Load both .env files
+load_dotenv(os.path.join(SCRIPT_DIR, '.env'))
+load_dotenv(os.path.join(PROJECT_DIR, '.env'))
 
 # Gmail + Calendar + Send scopes
 SCOPES = [
@@ -30,23 +45,49 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
-TOKEN_FILE = "token.json"
-CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+TOKEN_FILE = os.path.join(SCRIPT_DIR, "token.json")
+CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_PATH", os.path.join(SCRIPT_DIR, "credentials.json"))
+USERS_FILE = os.path.join(SCRIPT_DIR, "users.json")
+FLIGHTS_FILE = os.path.join(SCRIPT_DIR, "flights.json")
+
+GOOGLE_ROUTES_API_KEY = os.getenv("GOOGLE_ROUTES_API_KEY", "")
+
+
+# ─── Data files ──────────────────────────────────────────────────────────────
+
+def load_json(path, default=None):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default if default is not None else []
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+
+
+def load_users():
+    return load_json(USERS_FILE, [])
+
+
+def load_flights():
+    return load_json(FLIGHTS_FILE, [])
+
+
+def save_flights(flights):
+    save_json(FLIGHTS_FILE, flights)
 
 
 # ─── Auth ────────────────────────────────────────────────────────────────────
 
 def get_google_credentials() -> Credentials:
-    """
-    Loads cached OAuth token or runs the browser-based login flow.
-    On first run a browser window will open — log in and grant access.
-    The token is saved to token.json so you only do this once.
-    """
     creds = None
-
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -55,23 +96,16 @@ def get_google_credentials() -> Credentials:
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
-
     return creds
 
 
 # ─── Gmail ───────────────────────────────────────────────────────────────────
 
-def search_flight_emails(gmail_service, max_results: int = 5) -> list:
-    """
-    Searches Gmail for flight confirmation emails.
-    Returns a list of dicts with 'subject', 'from', 'date', and 'body'.
-    """
-    # Common flight confirmation keywords — adjust as needed
+def search_flight_emails(gmail_service, max_results: int = 10) -> list:
     query = (
         "subject:(flight OR booking OR confirmation OR itinerary OR e-ticket OR reservation) "
-        "newer_than:5d"
+        "newer_than:30d"
     )
-
     result = gmail_service.users().messages().list(
         userId="me", q=query, maxResults=max_results
     ).execute()
@@ -108,7 +142,6 @@ def search_flight_emails(gmail_service, max_results: int = 5) -> list:
             if payload:
                 plain_body = payload.decode("utf-8", errors="ignore")
 
-        # Prefer HTML stripped of tags — airline emails often have garbled plain text
         if html_body:
             body = re.sub(r"<[^>]+>", " ", html_body)
             body = re.sub(r"[ \t]{2,}", " ", body)
@@ -120,7 +153,8 @@ def search_flight_emails(gmail_service, max_results: int = 5) -> list:
             "subject": email_msg.get("Subject", ""),
             "from": email_msg.get("From", ""),
             "date": email_msg.get("Date", ""),
-            "body": body[:8000],  # cap at 8k chars to stay within token budget
+            "body": body[:8000],
+            "message_id": msg_ref["id"],
         })
 
     return emails
@@ -129,10 +163,6 @@ def search_flight_emails(gmail_service, max_results: int = 5) -> list:
 # ─── Claude parsing ──────────────────────────────────────────────────────────
 
 def parse_flight_details(email: dict) -> Optional[dict]:
-    """
-    Sends the email content to Claude and asks it to extract structured
-    flight information. Returns a dict or None if no flight info found.
-    """
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     prompt = f"""You are a flight itinerary parser. Extract all flight details from the email below.
@@ -155,10 +185,10 @@ Return ONLY a JSON object with this exact structure (no markdown, no explanation
       "flight_number": "...",
       "origin": "city name and airport code, e.g. Los Angeles (LAX)",
       "destination": "city name and airport code, e.g. New York (JFK)",
-      "departure_datetime": "ISO 8601 format WITHOUT timezone suffix, exactly as shown in the email, e.g. 2024-06-15T16:13:00 — do NOT convert to UTC",
-      "departure_timezone": "IANA timezone of departure city based on airport code, e.g. America/New_York for BOS",
-      "arrival_datetime": "ISO 8601 format WITHOUT timezone suffix, exactly as shown in the email, e.g. 2024-06-15T18:48:00 — do NOT convert to UTC",
-      "arrival_timezone": "IANA timezone of arrival city based on airport code, e.g. America/New_York for CHS",
+      "departure_datetime": "ISO 8601 format WITHOUT timezone suffix, e.g. 2024-06-15T16:13:00",
+      "departure_timezone": "IANA timezone of departure city",
+      "arrival_datetime": "ISO 8601 format WITHOUT timezone suffix",
+      "arrival_timezone": "IANA timezone of arrival city",
       "duration_minutes": 123
     }}
   ]
@@ -175,11 +205,9 @@ If a field is unknown, use null."""
     )
 
     raw = response.content[-1].text.strip()
-
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Claude occasionally wraps JSON in markdown — strip it
         if "```" in raw:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -189,32 +217,20 @@ If a field is unknown, use null."""
     if not data.get("is_flight_confirmation"):
         return None
 
-    # Debug — print what Claude extracted so we can verify times
-    print("\n  [DEBUG] Claude extracted:")
-    for f in data.get("flights", []):
-        print(f"    departure_datetime : {f.get('departure_datetime')}")
-        print(f"    departure_timezone : {f.get('departure_timezone')}")
-        print(f"    arrival_datetime   : {f.get('arrival_datetime')}")
-        print(f"    arrival_timezone   : {f.get('arrival_timezone')}")
-
     return data
 
 
 # ─── Google Calendar ──────────────────────────────────────────────────────────
 
 def create_calendar_event(calendar_service, flight: dict, trip: dict) -> str:
-    """
-    Creates a Google Calendar event for a single flight leg.
-    Returns the event URL.
-    """
     departure = flight["departure_datetime"]
     arrival = flight["arrival_datetime"]
     departure_tz = flight.get("departure_timezone") or "UTC"
     arrival_tz = flight.get("arrival_timezone") or "UTC"
 
     summary = (
-        f"{trip.get('airline', 'Flight')} {flight['flight_number']} — "
-        f"{flight['origin']} → {flight['destination']}"
+        f"{trip.get('airline', 'Flight')} {flight['flight_number']} -- "
+        f"{flight['origin']} -> {flight['destination']}"
     )
 
     description_lines = [
@@ -225,9 +241,6 @@ def create_calendar_event(calendar_service, flight: dict, trip: dict) -> str:
         f"Confirmation: {trip.get('confirmation_code', 'N/A')}",
         f"Passenger: {trip.get('passenger_name', 'N/A')}",
     ]
-    if flight.get("duration_minutes"):
-        h, m = divmod(flight["duration_minutes"], 60)
-        description_lines.append(f"Duration: {h}h {m}m")
 
     event = {
         "summary": summary,
@@ -237,8 +250,8 @@ def create_calendar_event(calendar_service, flight: dict, trip: dict) -> str:
         "reminders": {
             "useDefault": False,
             "overrides": [
-                {"method": "email", "minutes": 24 * 60},  # 1 day before
-                {"method": "popup", "minutes": 180},       # 3 hours before
+                {"method": "email", "minutes": 24 * 60},
+                {"method": "popup", "minutes": 180},
             ],
         },
     }
@@ -249,7 +262,6 @@ def create_calendar_event(calendar_service, flight: dict, trip: dict) -> str:
 
 # ─── GateTime Airport Arrival Calculator ─────────────────────────────────────
 
-# Seed estimates: terminal -> time_bucket -> {check_in, security}
 SEED_ESTIMATES = {
     "A": {"early_morning": (8, 8), "morning": (15, 20), "midday": (10, 12), "afternoon": (15, 18), "evening": (12, 15)},
     "B": {"early_morning": (10, 10), "morning": (18, 25), "midday": (12, 15), "afternoon": (18, 22), "evening": (14, 18)},
@@ -257,9 +269,8 @@ SEED_ESTIMATES = {
     "E": {"early_morning": (12, 12), "morning": (20, 25), "midday": (15, 15), "afternoon": (22, 25), "evening": (18, 20)},
 }
 
-WALK_TIMES = {"A": 6, "B": 6, "C": 5, "E": 6}  # avg walk minutes per terminal
+WALK_TIMES = {"A": 6, "B": 6, "C": 5, "E": 6}
 
-# Airline -> terminal mapping for BOS
 AIRLINE_TERMINAL = {
     "delta": "A",
     "american": "B", "american airlines": "B",
@@ -283,6 +294,8 @@ AIRLINE_TERMINAL = {
 
 INTERNATIONAL_TERMINALS = {"E"}
 
+BOS_ADDRESS = "1 Harborside Dr, Boston, MA 02128"  # Logan Airport address
+
 
 def get_time_bucket(hour: int) -> str:
     if 4 <= hour < 7: return "early_morning"
@@ -293,8 +306,6 @@ def get_time_bucket(hour: int) -> str:
 
 
 def calculate_arrive_by(departure_dt: datetime, airline: str) -> dict:
-    """Calculate when to arrive at the airport, working backward from flight time."""
-    # Resolve terminal
     airline_lower = airline.lower().strip()
     terminal = None
     for key, term in AIRLINE_TERMINAL.items():
@@ -302,13 +313,12 @@ def calculate_arrive_by(departure_dt: datetime, airline: str) -> dict:
             terminal = term
             break
     if not terminal:
-        terminal = "B"  # default fallback
+        terminal = "B"
 
     is_international = terminal in INTERNATIONAL_TERMINALS
     boarding_buffer = 45 if is_international else 30
     walk_time = WALK_TIMES.get(terminal, 6)
 
-    # Work backward to estimate arrival time bucket
     estimated_arrival_hour = (departure_dt - timedelta(minutes=boarding_buffer + walk_time + 20)).hour
     time_bucket = get_time_bucket(estimated_arrival_hour)
 
@@ -329,25 +339,86 @@ def calculate_arrive_by(departure_dt: datetime, airline: str) -> dict:
     }
 
 
-# ─── Email Reminder ──────────────────────────────────────────────────────────
+# ─── Google Routes API (Drive Time) ─────────────────────────────────────────
 
-def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, calc: dict):
-    """Send an HTML email reminder with GateTime's arrive-by breakdown."""
-    dep_dt = datetime.fromisoformat(flight["departure_datetime"])
+def get_drive_time(home_address: str, departure_time_iso: str = None) -> Optional[dict]:
+    """Call Google Routes API to get drive time from home to BOS."""
+    if not GOOGLE_ROUTES_API_KEY:
+        print("  [WARN] No GOOGLE_ROUTES_API_KEY, skipping drive time")
+        return None
+
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_ROUTES_API_KEY,
+        "X-Goog-FieldMask": "routes.duration,routes.staticDuration,routes.distanceMeters",
+    }
+
+    body = {
+        "origin": {"address": home_address},
+        "destination": {"address": BOS_ADDRESS},
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+    }
+
+    if departure_time_iso:
+        # Ensure proper ISO 8601 with timezone
+        if not departure_time_iso.endswith("Z") and "+" not in departure_time_iso:
+            departure_time_iso = departure_time_iso + "-05:00"  # ET default
+        body["departureTime"] = departure_time_iso
+
+    try:
+        resp = requests.post(url, json=body, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        routes = data.get("routes", [])
+        if not routes:
+            return None
+
+        route = routes[0]
+        duration_str = route.get("duration", "0s")
+        static_str = route.get("staticDuration", duration_str)
+        distance_m = route.get("distanceMeters", 0)
+
+        def parse_duration(s):
+            s = s.rstrip("s")
+            return int(s) // 60
+
+        return {
+            "durationMinutes": parse_duration(duration_str),
+            "durationInTrafficMinutes": parse_duration(static_str),
+            "distanceMiles": round(distance_m / 1609.34, 1),
+        }
+    except Exception as e:
+        print(f"  [WARN] Drive time API error: {e}")
+        return None
+
+
+# ─── Email Templates ─────────────────────────────────────────────────────────
+
+def build_day_before_email(flight, trip, calc, drive_info, leave_home_dt, dep_dt):
+    """Build HTML for the day-before reminder with full timeline."""
     arrive_by = calc["arrive_by"]
+    drive_mins = drive_info["durationMinutes"] if drive_info else 30
+    drive_dist = drive_info["distanceMiles"] if drive_info else "?"
 
-    subject = f"GateTime Reminder: Arrive at BOS by {arrive_by.strftime('%I:%M %p')} for {flight['flight_number']}"
-
-    html = f"""<html><body style="font-family: 'Inter', Arial, sans-serif; background: #F5F6F8; padding: 20px;">
+    return f"""<html><body style="font-family: 'Inter', Arial, sans-serif; background: #F5F6F8; padding: 20px;">
 <div style="max-width: 560px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.06);">
 
   <!-- Header -->
   <div style="background: #0A0F1E; padding: 32px 28px; text-align: center;">
     <div style="color: #C5A255; font-size: 12px; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 4px;">GateTime Reminder</div>
-    <div style="color: white; font-size: 14px; opacity: 0.6; margin-bottom: 16px;">Boston Logan International (BOS)</div>
-    <div style="color: #34D399; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 6px;">ARRIVE AT AIRPORT BY</div>
-    <div style="color: white; font-size: 48px; font-weight: 700; font-family: 'Poppins', Arial, sans-serif; line-height: 1.1;">{arrive_by.strftime('%I:%M %p')}</div>
-    <div style="color: rgba(255,255,255,0.5); font-size: 13px; margin-top: 8px;">Terminal {calc['terminal']} &middot; {trip.get('airline', 'Airline')}</div>
+    <div style="color: white; font-size: 14px; opacity: 0.6; margin-bottom: 20px;">Tomorrow you fly from Boston Logan (BOS)</div>
+
+    <div style="color: #34D399; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px;">LEAVE HOME BY</div>
+    <div style="color: white; font-size: 52px; font-weight: 700; font-family: 'Poppins', Arial, sans-serif; line-height: 1.1;">{leave_home_dt.strftime('%I:%M %p')}</div>
+
+    <div style="height: 1px; background: rgba(255,255,255,0.1); margin: 16px 0;"></div>
+
+    <div style="color: rgba(255,255,255,0.5); font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px;">ARRIVE AT AIRPORT BY</div>
+    <div style="color: white; font-size: 32px; font-weight: 700; font-family: 'Poppins', Arial, sans-serif;">{arrive_by.strftime('%I:%M %p')}</div>
+    <div style="color: rgba(255,255,255,0.4); font-size: 13px; margin-top: 6px;">Terminal {calc['terminal']} &middot; {trip.get('airline', '')}</div>
   </div>
 
   <!-- Flight info -->
@@ -358,14 +429,36 @@ def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, 
     <div style="font-size: 13px; color: #6B7280; margin-top: 2px;">Confirmation: <strong>{trip.get('confirmation_code', 'N/A')}</strong></div>
   </div>
 
-  <!-- Timeline breakdown -->
+  <!-- Timeline -->
   <div style="padding: 24px 28px;">
     <div style="font-size: 11px; color: #6B7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px;">Your Timeline</div>
 
-    <!-- Arrive at airport -->
-    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+    <!-- Leave home -->
+    <div style="display: flex; align-items: flex-start;">
       <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
         <div style="width: 14px; height: 14px; border-radius: 50%; background: #34D399; border: 3px solid #D1FAE5;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 15px; font-weight: 700; color: #1A1A2E;">{leave_home_dt.strftime('%I:%M %p')} - Leave home</div>
+      </div>
+    </div>
+
+    <!-- Drive -->
+    <div style="display: flex; align-items: flex-start;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 10px; height: 10px; border-radius: 50%; background: #8B5CF6; margin-top: 2px;"></div>
+        <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
+      </div>
+      <div style="margin-left: 12px; padding-bottom: 12px;">
+        <div style="font-size: 14px; color: #1A1A2E;"><strong>{drive_mins} min</strong> - Drive to BOS ({drive_dist} mi)</div>
+      </div>
+    </div>
+
+    <!-- Arrive at airport -->
+    <div style="display: flex; align-items: flex-start;">
+      <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
+        <div style="width: 12px; height: 12px; border-radius: 50%; background: #34D399; margin-top: 1px;"></div>
         <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
       </div>
       <div style="margin-left: 12px; padding-bottom: 12px;">
@@ -375,7 +468,7 @@ def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, 
     </div>
 
     <!-- Check-in -->
-    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+    <div style="display: flex; align-items: flex-start;">
       <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
         <div style="width: 10px; height: 10px; border-radius: 50%; background: #3B82F6; margin-top: 2px;"></div>
         <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
@@ -386,7 +479,7 @@ def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, 
     </div>
 
     <!-- Security -->
-    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+    <div style="display: flex; align-items: flex-start;">
       <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
         <div style="width: 10px; height: 10px; border-radius: 50%; background: #F59E0B; margin-top: 2px;"></div>
         <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
@@ -396,8 +489,8 @@ def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, 
       </div>
     </div>
 
-    <!-- Walk to gate -->
-    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+    <!-- Walk -->
+    <div style="display: flex; align-items: flex-start;">
       <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
         <div style="width: 10px; height: 10px; border-radius: 50%; background: #6B7280; margin-top: 2px;"></div>
         <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
@@ -408,13 +501,13 @@ def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, 
     </div>
 
     <!-- Boarding -->
-    <div style="display: flex; align-items: flex-start; margin-bottom: 0;">
+    <div style="display: flex; align-items: flex-start;">
       <div style="width: 24px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;">
         <div style="width: 10px; height: 10px; border-radius: 50%; background: #34D399; margin-top: 2px;"></div>
         <div style="width: 1px; height: 28px; background: #E5E7EB;"></div>
       </div>
       <div style="margin-left: 12px; padding-bottom: 12px;">
-        <div style="font-size: 14px; color: #1A1A2E;"><strong>{calc['boarding_buffer']} min</strong> - Boarding {'(international)' if calc['is_international'] else ''}</div>
+        <div style="font-size: 14px; color: #1A1A2E;"><strong>{calc['boarding_buffer']} min</strong> - Boarding</div>
       </div>
     </div>
 
@@ -430,39 +523,72 @@ def send_reminder_email(gmail_service, to_email: str, flight: dict, trip: dict, 
     </div>
   </div>
 
-  <!-- Footer note -->
+  <!-- Footer -->
   <div style="padding: 16px 28px; background: #F9FAFB; border-top: 1px solid #F0F0F0; text-align: center;">
-    <div style="font-size: 11px; color: #9CA3AF;">Allow extra 10 min if driving/parking &middot; Estimates based on GateTime data</div>
+    <div style="font-size: 11px; color: #9CA3AF;">Visit <a href="https://gatetime-v2.vercel.app" style="color: #34D399; text-decoration: none;">GateTime</a> for live wait times</div>
+  </div>
+
+</div>
+</body></html>"""
+
+
+def build_urgent_email(flight, trip, calc, drive_info, leave_home_dt, dep_dt):
+    """Build HTML for the 5-hours-before urgent reminder."""
+    arrive_by = calc["arrive_by"]
+    drive_mins = drive_info["durationMinutes"] if drive_info else 30
+
+    return f"""<html><body style="font-family: 'Inter', Arial, sans-serif; background: #F5F6F8; padding: 20px;">
+<div style="max-width: 560px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.06);">
+
+  <!-- Header - urgent orange accent -->
+  <div style="background: #0A0F1E; padding: 32px 28px; text-align: center;">
+    <div style="color: #F59E0B; font-size: 12px; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 4px;">TIME TO GET READY</div>
+    <div style="color: white; font-size: 14px; opacity: 0.6; margin-bottom: 20px;">{trip.get('airline', '')} {flight['flight_number']} to {flight['destination']}</div>
+
+    <div style="color: #F59E0B; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px;">LEAVE HOME BY</div>
+    <div style="color: white; font-size: 56px; font-weight: 700; font-family: 'Poppins', Arial, sans-serif; line-height: 1.1;">{leave_home_dt.strftime('%I:%M %p')}</div>
+
+    <div style="height: 1px; background: rgba(255,255,255,0.1); margin: 16px 0;"></div>
+
+    <div style="display: inline-block; background: rgba(255,255,255,0.1); border-radius: 12px; padding: 12px 24px;">
+      <div style="color: rgba(255,255,255,0.5); font-size: 10px; letter-spacing: 2px; text-transform: uppercase;">ARRIVE AT BOS BY</div>
+      <div style="color: white; font-size: 24px; font-weight: 700; font-family: 'Poppins', Arial, sans-serif;">{arrive_by.strftime('%I:%M %p')}</div>
+      <div style="color: rgba(255,255,255,0.4); font-size: 12px;">Terminal {calc['terminal']} &middot; {drive_mins} min drive</div>
+    </div>
+  </div>
+
+  <!-- Quick info -->
+  <div style="padding: 24px 28px; text-align: center;">
+    <div style="font-size: 14px; color: #1A1A2E; margin-bottom: 4px;">Flight departs at <strong>{dep_dt.strftime('%I:%M %p')}</strong></div>
+    <div style="font-size: 13px; color: #6B7280;">Confirmation: <strong>{trip.get('confirmation_code', 'N/A')}</strong></div>
+  </div>
+
+  <!-- Footer -->
+  <div style="padding: 16px 28px; background: #F9FAFB; border-top: 1px solid #F0F0F0; text-align: center;">
+    <div style="font-size: 11px; color: #9CA3AF;">Drive time based on current traffic conditions</div>
     <div style="font-size: 11px; color: #9CA3AF; margin-top: 4px;">Visit <a href="https://gatetime-v2.vercel.app" style="color: #34D399; text-decoration: none;">GateTime</a> for live wait times</div>
   </div>
 
 </div>
 </body></html>"""
 
+
+def send_html_email(gmail_service, to_email: str, subject: str, html: str):
+    """Send an HTML email via Gmail API."""
     message = MIMEText(html, "html")
     message["to"] = to_email
     message["subject"] = subject
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
-    gmail_service.users().messages().send(
-        userId="me", body={"raw": raw}
-    ).execute()
-
-    print(f"     Email reminder sent to {to_email}")
+    gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    print(f"     Email sent to {to_email}")
 
 
-def schedule_reminder(gmail_service, to_email: str, flight: dict, trip: dict, calc: dict):
-    """Send reminder immediately (for now). In production, schedule 5h before departure."""
-    dep_dt = datetime.fromisoformat(flight["departure_datetime"])
-    arrive_by = calc["arrive_by"]
+# ─── Main Logic ──────────────────────────────────────────────────────────────
 
-    print(f"     Arrive at airport by: {arrive_by.strftime('%I:%M %p')}")
-    print(f"     Breakdown: check-in {calc['check_in']}m + security {calc['security']}m + walk {calc['walk_time']}m + boarding {calc['boarding_buffer']}m = {calc['total_buffer']}m before flight")
+def flight_key(flight_number, departure_datetime, user_email):
+    """Unique key to identify a flight for dedup."""
+    return f"{flight_number}|{departure_datetime}|{user_email}"
 
-    send_reminder_email(gmail_service, to_email, flight, trip, calc)
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print("Authenticating with Google...")
@@ -470,44 +596,182 @@ def main():
     gmail = build("gmail", "v1", credentials=creds)
     calendar = build("calendar", "v3", credentials=creds)
 
-    print("Searching for flight confirmation emails...")
-    emails = search_flight_emails(gmail, max_results=10)
-
-    if not emails:
-        print("Done - no flight emails found.")
-        return
-
-    print(f"Found {len(emails)} candidate email(s). Parsing with Claude...")
-
-    # Get user's email for reminders
+    # Get signed-in user email
     profile = gmail.users().getProfile(userId="me").execute()
     user_email = profile["emailAddress"]
     print(f"Signed in as: {user_email}")
 
-    created_count = 0
-    for email in emails:
-        print(f"\n  Checking: {email['subject'][:70]}")
-        trip = parse_flight_details(email)
+    # Load registered users
+    users = load_users()
+    user = next((u for u in users if u["email"].lower() == user_email.lower()), None)
+    home_address = user["homeAddress"] if user else None
 
-        if not trip:
-            print("  -> Not a flight confirmation, skipping.")
+    if home_address:
+        print(f"Home address: {home_address}")
+    else:
+        print("No home address registered (drive time will be estimated)")
+
+    # Load tracked flights
+    tracked_flights = load_flights()
+    tracked_keys = {f.get("key", "") for f in tracked_flights}
+
+    # ── Phase A: Scan for new flight emails ──────────────────────────────────
+
+    print("\nSearching for flight confirmation emails...")
+    emails = search_flight_emails(gmail, max_results=10)
+
+    new_flights_found = 0
+    if emails:
+        print(f"Found {len(emails)} candidate email(s). Parsing with Claude...")
+
+        for email_data in emails:
+            print(f"\n  Checking: {email_data['subject'][:70]}")
+            trip = parse_flight_details(email_data)
+
+            if not trip:
+                print("  -> Not a flight confirmation, skipping.")
+                continue
+
+            print(f"  -> Flight found! {trip.get('airline')} | {trip.get('confirmation_code')}")
+
+            for flight in trip.get("flights", []):
+                fkey = flight_key(flight["flight_number"], flight["departure_datetime"], user_email)
+
+                if fkey in tracked_keys:
+                    print(f"     {flight['flight_number']}: Already tracked, skipping.")
+                    continue
+
+                print(f"     {flight['flight_number']}: {flight['origin']} -> {flight['destination']}")
+
+                # Create calendar event
+                try:
+                    url = create_calendar_event(calendar, flight, trip)
+                    print(f"     Calendar event created: {url}")
+                except Exception as e:
+                    print(f"     Calendar event error: {e}")
+
+                # Calculate arrive-by
+                dep_dt = datetime.fromisoformat(flight["departure_datetime"])
+                calc = calculate_arrive_by(dep_dt, trip.get("airline", ""))
+
+                # Get drive time
+                drive_info = None
+                leave_home_dt = calc["arrive_by"] - timedelta(minutes=30)  # default 30 min
+                if home_address:
+                    drive_info = get_drive_time(home_address, calc["arrive_by"].isoformat() + "Z")
+                    if drive_info:
+                        leave_home_dt = calc["arrive_by"] - timedelta(minutes=drive_info["durationMinutes"])
+                        print(f"     Drive time: {drive_info['durationMinutes']} min ({drive_info['distanceMiles']} mi)")
+
+                print(f"     Leave home by: {leave_home_dt.strftime('%I:%M %p')}")
+                print(f"     Arrive at airport by: {calc['arrive_by'].strftime('%I:%M %p')}")
+
+                # Save to tracked flights
+                flight_record = {
+                    "key": fkey,
+                    "flightNumber": flight["flight_number"],
+                    "airline": trip.get("airline", ""),
+                    "origin": flight["origin"],
+                    "destination": flight["destination"],
+                    "departureDateTime": flight["departure_datetime"],
+                    "departureTz": flight.get("departure_timezone", "America/New_York"),
+                    "confirmationCode": trip.get("confirmation_code", ""),
+                    "passengerName": trip.get("passenger_name", ""),
+                    "userEmail": user_email,
+                    "homeAddress": home_address or "",
+                    "terminal": calc["terminal"],
+                    "arriveByTime": calc["arrive_by"].isoformat(),
+                    "leaveHomeTime": leave_home_dt.isoformat(),
+                    "driveMinutes": drive_info["durationMinutes"] if drive_info else 30,
+                    "driveMiles": drive_info["distanceMiles"] if drive_info else None,
+                    "reminderDayBeforeSent": False,
+                    "reminder5HoursSent": False,
+                    "detectedAt": datetime.now().isoformat(),
+                }
+                tracked_flights.append(flight_record)
+                tracked_keys.add(fkey)
+                new_flights_found += 1
+
+                # Send immediate confirmation email (day-before style)
+                try:
+                    html = build_day_before_email(flight, trip, calc, drive_info, leave_home_dt, dep_dt)
+                    subject = f"GateTime: Leave home by {leave_home_dt.strftime('%I:%M %p')} for {flight['flight_number']}"
+                    send_html_email(gmail, user_email, subject, html)
+                except Exception as e:
+                    print(f"     Email error: {e}")
+
+    save_flights(tracked_flights)
+
+    # ── Phase B: Check for due reminders ─────────────────────────────────────
+
+    print("\nChecking scheduled reminders...")
+    now = datetime.now()
+    reminders_sent = 0
+
+    for rec in tracked_flights:
+        dep_dt = datetime.fromisoformat(rec["departureDateTime"])
+
+        # Skip past flights
+        if dep_dt < now:
             continue
 
-        print(f"  -> Flight found! {trip.get('airline')} | {trip.get('confirmation_code')}")
+        leave_home_dt = datetime.fromisoformat(rec["leaveHomeTime"])
+        hours_until_departure = (dep_dt - now).total_seconds() / 3600
+        hours_until_leave = (leave_home_dt - now).total_seconds() / 3600
 
-        for flight in trip.get("flights", []):
-            print(f"     {flight['flight_number']}: {flight['origin']} -> {flight['destination']}")
-            url = create_calendar_event(calendar, flight, trip)
-            print(f"     Calendar event created: {url}")
+        # Build minimal flight/trip dicts for email templates
+        flight_info = {
+            "flight_number": rec["flightNumber"],
+            "origin": rec["origin"],
+            "destination": rec["destination"],
+            "departure_datetime": rec["departureDateTime"],
+        }
+        trip_info = {
+            "airline": rec["airline"],
+            "confirmation_code": rec["confirmationCode"],
+        }
+        calc_info = calculate_arrive_by(dep_dt, rec["airline"])
 
-            # Calculate GateTime arrive-by and send email reminder
-            dep_dt = datetime.fromisoformat(flight["departure_datetime"])
-            calc = calculate_arrive_by(dep_dt, trip.get("airline", ""))
-            schedule_reminder(gmail, user_email, flight, trip, calc)
+        # Day-before reminder: 23-25 hours before departure
+        if not rec.get("reminderDayBeforeSent") and 23 <= hours_until_departure <= 25:
+            print(f"  Sending day-before reminder for {rec['flightNumber']}...")
+            drive_info = None
+            if rec.get("homeAddress"):
+                drive_info = get_drive_time(rec["homeAddress"], calc_info["arrive_by"].isoformat() + "Z")
+                if drive_info:
+                    leave_home_dt = calc_info["arrive_by"] - timedelta(minutes=drive_info["durationMinutes"])
 
-            created_count += 1
+            html = build_day_before_email(flight_info, trip_info, calc_info, drive_info, leave_home_dt, dep_dt)
+            subject = f"Tomorrow you fly! Leave home by {leave_home_dt.strftime('%I:%M %p')}"
+            try:
+                send_html_email(gmail, rec["userEmail"], subject, html)
+                rec["reminderDayBeforeSent"] = True
+                reminders_sent += 1
+            except Exception as e:
+                print(f"     Error: {e}")
 
-    print(f"\nDone. Created {created_count} calendar event(s) with email reminders.")
+        # 5-hours-before reminder: 4.5-5.5 hours before leave time
+        if not rec.get("reminder5HoursSent") and 4.5 <= hours_until_leave <= 5.5:
+            print(f"  Sending 5-hours-before reminder for {rec['flightNumber']}...")
+            # Fresh drive time with current traffic
+            drive_info = None
+            if rec.get("homeAddress"):
+                drive_info = get_drive_time(rec["homeAddress"], calc_info["arrive_by"].isoformat() + "Z")
+                if drive_info:
+                    leave_home_dt = calc_info["arrive_by"] - timedelta(minutes=drive_info["durationMinutes"])
+
+            html = build_urgent_email(flight_info, trip_info, calc_info, drive_info, leave_home_dt, dep_dt)
+            subject = f"Time to get ready! Leave by {leave_home_dt.strftime('%I:%M %p')} for {rec['flightNumber']}"
+            try:
+                send_html_email(gmail, rec["userEmail"], subject, html)
+                rec["reminder5HoursSent"] = True
+                reminders_sent += 1
+            except Exception as e:
+                print(f"     Error: {e}")
+
+    save_flights(tracked_flights)
+
+    print(f"\nDone. {new_flights_found} new flight(s) detected, {reminders_sent} reminder(s) sent.")
 
 
 if __name__ == "__main__":
