@@ -1,6 +1,6 @@
 'use client'
 import { useState } from 'react'
-import { Mail, CheckCircle, MapPin, Plane } from 'lucide-react'
+import { Mail, CheckCircle, MapPin, Plane, Search, Loader2 } from 'lucide-react'
 
 export default function GmailConnect() {
   const [email, setEmail] = useState('')
@@ -40,6 +40,28 @@ export default function GmailConnect() {
     setSavedEmail(email.trim())
   }
 
+  const [scanStatus, setScanStatus] = useState<'idle' | 'scanning' | 'done' | 'error'>('idle')
+  const [scanOutput, setScanOutput] = useState('')
+
+  const triggerScan = async () => {
+    setScanStatus('scanning')
+    setScanOutput('')
+    try {
+      const res = await fetch('/api/scan', { method: 'POST' })
+      const data = await res.json()
+      if (data.success) {
+        setScanStatus('done')
+        setScanOutput(data.output || 'Scan complete!')
+      } else {
+        setScanStatus('error')
+        setScanOutput(data.error || 'Scan failed')
+      }
+    } catch {
+      setScanStatus('error')
+      setScanOutput('Could not reach scanner. Make sure the local dev server is running.')
+    }
+  }
+
   if (status === 'success') {
     return (
       <div className="bg-[#0A0F1E] rounded-2xl p-8 lg:p-12 text-center">
@@ -53,7 +75,7 @@ export default function GmailConnect() {
           We&apos;ll scan <span className="text-white font-medium">{savedEmail}</span> for flight confirmations
           and send you personalized reminders before each flight.
         </p>
-        <div className="bg-white/5 rounded-xl p-4 max-w-sm mx-auto text-left space-y-2">
+        <div className="bg-white/5 rounded-xl p-4 max-w-sm mx-auto text-left space-y-2 mb-6">
           <div className="flex items-start gap-2">
             <Mail size={14} className="text-[#34D399] mt-0.5 flex-shrink-0" />
             <p className="text-white/50 text-xs">A welcome email will be sent to confirm your registration</p>
@@ -67,6 +89,26 @@ export default function GmailConnect() {
             <p className="text-white/50 text-xs">Reminders include your personalized leave-home time with drive time</p>
           </div>
         </div>
+
+        {/* Scan trigger button */}
+        <button
+          onClick={triggerScan}
+          disabled={scanStatus === 'scanning'}
+          className="inline-flex items-center gap-2 px-6 py-3 bg-[#34D399] hover:bg-[#2CC38A] disabled:opacity-50 text-[#0A0F1E] font-bold text-sm rounded-xl transition-colors"
+          style={{ fontFamily: 'Poppins, sans-serif' }}
+        >
+          {scanStatus === 'scanning' ? (
+            <><Loader2 size={16} className="animate-spin" /> Scanning inbox...</>
+          ) : (
+            <><Search size={16} /> Scan for flights now</>
+          )}
+        </button>
+        {scanStatus === 'done' && (
+          <p className="text-[#34D399] text-xs mt-3">Scan complete! Check your inbox for any new reminders.</p>
+        )}
+        {scanStatus === 'error' && (
+          <p className="text-red-400 text-xs mt-3">{scanOutput}</p>
+        )}
       </div>
     )
   }
